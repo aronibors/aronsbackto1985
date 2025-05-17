@@ -1,169 +1,169 @@
 #!/usr/bin/env python3
-import curses
-import time
-import random
-import numpy as np
-import simpleaudio as sa
+import curses, time, random, math, threading
+import numpy as np, simpleaudio as sa
 
-# Configuration
-TICK = 0.05                       # Frame delay
-INITIAL_SPAWN_RATE = 0.2          # Initial obstacle spawn chance
-MAX_SPAWN_RATE = 1.0              # Max spawn chance
-SPAWN_INCREASE = 0.05             # Spawn increase per speed-up
-GRAVITY = 1                       # Gravity per frame
-JUMP_VELOCITY = -5                # Jump velocity
-SPEED_UP_INTERVAL = 10.0          # Seconds between speed-ups
-LEVEL_COUNT = 3                   # Levels to complete
+# ― Config ―
+FS = 44100           # Sample rate
+BG_SEC = 30          # Background track length (s)
+INT_INC = 0.1        # +10% pitch/tempo per level
+GR = 1               # Gravity per frame
+LEVELS = 3
+SPAWN0 = 0.2
+SPEED_INT = 10       # Seconds between speedups
+TICK = 0.05          # Frame delay
 
-# Audio helpers
-def play_tone(freq, duration_ms, block=True):
-    fs = 44100
-    t = np.linspace(0, duration_ms/1000, int(fs*duration_ms/1000), False)
-    wave = np.sin(freq*2*np.pi*t)*0.3
-    audio = (wave*32767).astype(np.int16)
-    play_obj = sa.play_buffer(audio, 1, 2, fs)
-    if block:
-        play_obj.wait_done()
+# ― Tone generation ―
+def gen_sq(freq, ms):
+    t = np.linspace(0, ms/1000, int(FS*ms/1000), False)
+    w = np.sign(np.sin(2*math.pi*freq*t)) * 0.3
+    return (w*32767).astype(np.int16)
 
-def play_square_tone(freq, duration_ms, block=True):
-    fs = 44100
-    t = np.linspace(0, duration_ms/1000, int(fs*duration_ms/1000), False)
-    wave = np.sign(np.sin(freq*2*np.pi*t))*0.3
-    audio = (wave*32767).astype(np.int16)
-    play_obj = sa.play_buffer(audio, 1, 2, fs)
-    if block:
-        play_obj.wait_done()
+JUMP = gen_sq(700,50)
+HIT  = gen_sq(300,50)
+WIN  = [gen_sq(f,100) for f in (500,750,1125)]
+FAIL = [gen_sq(f,d) for f,d in ((450,660),(300,660),(200,1000))]
 
-# Level complete: square 'weep' tones
-def play_success_sound():
-    freqs = [500, 750, 1125]
-    for f in freqs:
-        play_square_tone(f, 100)
-        time.sleep(0.05)
+# ― Build a non-repeating 30s track ―
+def build_bg(level):
+    notes = [440,494,523,587,659,698,784]
+    factor = 1 + INT_INC*(level-1)
+    target = int(FS*BG_SEC)
+    buf = np.zeros(0, np.int16)
+    while buf.size < target:
+        f = random.choice(notes)
+        d = random.choice((100,150,200,300))
+        buf = np.concatenate([buf, gen_sq(int(f*factor), d)])
+    return buf[:target]
 
-# Game-over: 'wah wah waaaah' sine tones
-def play_fail_sound():
-    base = 450
-    freqs = [base, int(base*0.67), int(base*0.67*0.67)]
-    durations = [660, 660, 1000]
-    for f, d in zip(freqs, durations):
-        play_tone(f, d)
-        time.sleep(0.1)
+# ― Playback helpers ―
+def play_async(buf):
+    sa.play_buffer(buf, 1, 2, FS)
 
-# Single level
-def play_level(stdscr, level, carry):
+def play_block(buf):
+    sa.play_buffer(buf, 1, 2, FS).wait_done()
+
+# ― Level loop ―
+def play_level(stdscr, lvl, carry):
     sh, sw = stdscr.getmaxyx()
-    x = sw//4
-    y = sh-2
-    vy = 0
-    on_ground = True
-    obstacles = []
-    speed = level
-    spawn_rate = min(MAX_SPAWN_RATE, INITIAL_SPAWN_RATE + 0.1*(level-1))
+    # jump velocities
+    v1 = -int(math.sqrt(2*GR*(0.18*sh)))
+    v2 = -int(math.sqrt(2*GR*(0.36*sh)))
+
+    # start bg music
+    bg = build_bg(lvl)
+    threading.Thread(target=play_async, args=(bg,), daemon=True).start()
+
+    x, y, vy = sw//4, sh-2, 0
+    on_ground, jumps = True, 0
+    obs = []
+    speed = lvl
+    spawn = min(1.0, SPAWN0 + 0.1*(lvl-1))
     lives = 1 + carry
-    speed_ups = 0
-    last_up = time.time()
-    ship_char = '^'
+    ups, last_up = 0, time.time()
 
     while True:
-        t0 = time.time()
-        # Speed-ups
-        if t0 - last_up >= SPEED_UP_INTERVAL:
+        now = time.time()
+        # speed-up events
+        if now - last_up >= SPEED_INT:
             speed += 1
-            spawn_rate = min(MAX_SPAWN_RATE, spawn_rate + SPAWN_INCREASE)
-            speed_ups += 1
-            last_up = t0
-            if speed_ups >= 3:
-                play_success_sound()
+            spawn = min(1.0, spawn + 0.05)
+            ups += 1
+            last_up = now
+            if ups >= 3:
+                for w in WIN: play_block(w)
                 stdscr.clear()
-                msg = f'Level {level} Complete!'
+                msg = f"Level {lvl} Complete!"
                 stdscr.addstr(sh//2, (sw-len(msg))//2, msg, curses.color_pair(3))
                 stdscr.refresh()
-                time.sleep(3)
+                time.sleep(2)
                 return True, lives
 
-        # Input
+        # input
         key = stdscr.getch()
         if key in (ord('q'), ord('Q')):
             return False, lives
-        elif key == curses.KEY_LEFT and x > 1:
+        if key == curses.KEY_LEFT and x > 1:
             x -= 1
-        elif key == curses.KEY_RIGHT and x < sw-2:
+        if key == curses.KEY_RIGHT and x < sw-2:
             x += 1
-        elif key == ord(' ') and on_ground:
-            play_square_tone(700, 50, block=False)
-            vy = JUMP_VELOCITY
-            on_ground = False
+        if key == ord(' '):
+            if on_ground:
+                play_block(JUMP)
+                vy, on_ground, jumps = v1, False, 1
+            elif jumps == 1:
+                play_block(JUMP)
+                vy, jumps = v2, 2
 
-        # Gravity
+        # physics
         if not on_ground:
             y += vy
-            vy += GRAVITY
+            vy += GR
             if y >= sh-2:
-                y = sh-2
-                vy = 0
-                on_ground = True
+                y, vy, on_ground, jumps = sh-2, 0, True, 0
+            if y < 1:
+                y, vy = 1, 0
 
-        # Spawn obstacles
-        if random.random() < spawn_rate:
-            obstacles.append({'row': random.randint(1, sh-2), 'col': sw-2})
-        # Move & remove
-        for o in obstacles:
-            o['col'] -= speed
-        obstacles = [o for o in obstacles if o['col'] > 0]
+        # spawn & move obstacles
+        if random.random() < spawn:
+            obs.append({'r': random.randint(1, sh-2), 'c': sw-2})
+        for o in obs:
+            o['c'] -= speed
+        obs = [o for o in obs if o['c'] > 0]
 
-        # Collision
-        for o in obstacles.copy():
-            if o['col'] == x and o['row'] == y:
-                play_square_tone(300, 50, block=False)
+        # collisions
+        for o in obs.copy():
+            if o['c'] == x and o['r'] == y:
+                play_block(HIT)
                 if lives > 0:
                     lives -= 1
-                    obstacles.remove(o)
+                    obs.remove(o)
                 else:
-                    play_fail_sound()
+                    for f in FAIL: play_block(f)
                     stdscr.clear()
-                    msg = 'GAME OVER'
-                    stdscr.addstr(sh//2, (sw-len(msg))//2, msg, curses.color_pair(3))
+                    stdscr.addstr(sh//2, (sw-9)//2, "GAME OVER",
+                                  curses.color_pair(3))
                     stdscr.refresh()
-                    time.sleep(3)
+                    time.sleep(2)
                     return False, 0
 
-        # Draw
+        # draw
         stdscr.clear()
         stdscr.border()
-        stdscr.addch(y, x, ship_char, curses.color_pair(1))
-        for o in obstacles:
-            stdscr.addch(o['row'], o['col'], '-', curses.color_pair(2))
-        stdscr.addstr(0,2, f'Lvl:{level}/{LEVEL_COUNT}', curses.color_pair(3))
-        stdscr.addstr(0,15, f'Spd:{speed}', curses.color_pair(3))
-        stdscr.addstr(0,25, f'Spawn:{spawn_rate:.2f}', curses.color_pair(3))
-        stdscr.addstr(0,40, f'Life:{lives}', curses.color_pair(3))
+        stdscr.addch(y, x, '^', curses.color_pair(1))
+        for o in obs:
+            stdscr.addch(o['r'], o['c'], '-', curses.color_pair(2))
+        stdscr.addstr(0, 2,  f'Lvl:{lvl}/{LEVELS}', curses.color_pair(3))
+        stdscr.addstr(0, 15, f'Spd:{speed}',      curses.color_pair(3))
+        stdscr.addstr(0, 30, f'Spawn:{spawn:.2f}',curses.color_pair(3))
+        stdscr.addstr(0, 45, f'Life:{lives}',     curses.color_pair(3))
         stdscr.refresh()
 
-        # Throttle
-        dt = time.time() - t0
+        # throttle
+        dt = time.time() - now
         if dt < TICK:
             time.sleep(TICK - dt)
 
-# Main
+# ― Main ―
 def main(stdscr):
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.keypad(True)
     curses.start_color()
-    curses.init_pair(1, curses.COLOR_BLUE, curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
-    curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLACK)
-    carry_lives = 0
-    for lvl in range(1, LEVEL_COUNT+1):
-        proceed, carry_lives = play_level(stdscr, lvl, carry_lives)
-        if not proceed:
+    curses.init_pair(1, curses.COLOR_BLUE,  0)
+    curses.init_pair(2, curses.COLOR_RED,   0)
+    curses.init_pair(3, curses.COLOR_WHITE, 0)
+
+    carry = 0
+    for lvl in range(1, LEVELS+1):
+        ok, carry = play_level(stdscr, lvl, carry)
+        if not ok:
             return
-    play_success_sound()
+
+    # after level 3
     stdscr.clear()
-    msg = 'CONGRATULATIONS! YOU WON!'
-    sh, sw = stdscr.getmaxyx()
-    stdscr.addstr(sh//2, (sw-len(msg))//2, msg, curses.color_pair(3))
+    msg = "Congratulations! You Won!"
+    h, w = stdscr.getmaxyx()
+    stdscr.addstr(h//2, (w-len(msg))//2, msg, curses.color_pair(3))
     stdscr.refresh()
     time.sleep(3)
 
